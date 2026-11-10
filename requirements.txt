@@ -1,0 +1,9 @@
+pyserial>=3.5
+requests>=2.31
+inference>=1.8
+python-dotenv>=1.0
+pygame>=2.6
+# inference pulls in opencv-python-headless (no windows). Install this AFTER it,
+# with --reinstall, so the GUI build's files win:  uv pip install --reinstall opencv-python==4.11.0.86
+opencv-python==4.11.0.86
+numpy>=2.0,<2.4

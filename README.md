@@ -79,6 +79,11 @@ rover command to `data/logs/`.
 
 ## Rover notes
 
+- Firmware backup: `data/firmware/pathfinder-v1.3.5-esp32-2cbcbb4dc364-full-4MB.bin`
+  (full 4 MB flash, read twice and identical; SHA-256 in the `.sha256` file next to it).
+  It's git-ignored and contains the saved Wi-Fi password, so keep it private. Restore with
+  `uv pip install esptool && uv run esptool --port /dev/cu.usbmodem* --no-stub write-flash 0 <file>`.
+  The stub flasher fails on this board's USB adapter (checksum error), hence `--no-stub`.
 - HTTP: `GET http://<rover>/js?json={...}` — no API key needed (the Pathfinder
   `x-api-key` is only for its `/v1`, `/v2` movement-plan API).
 - `{"T":1,"L":l,"R":r}` wheel speeds (about -0.5..0.5) · `{"T":0}` emergency stop ·

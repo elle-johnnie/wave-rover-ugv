@@ -26,7 +26,7 @@ Rover address defaults to `192.168.68.88`; override with `ROVER_HOST=... ` or `-
 | `rover.py` | Wi-Fi drive control with speed clamp, keep-alive and dead-man stop |
 | `camera.py` | Low-lag phone stream reader; preview, latency check, frame capture to `data/raw/` |
 | `detect.py` | Roboflow model on the stream + LEFT/CENTER/RIGHT lane check; shows the decision, **doesn't drive** |
-| `drive.py` | **Moves the rover.** Switch Pro Controller: stick drives, hold R for autonomous, A stops, X records frames |
+| `drive.py` | **Moves the rover.** Switch Pro Controller: hold L (or ZL to boost) + stick drives, hold R for autonomous, A stops, X records |
 | `send.py` | Send any JSON command over **USB serial**; `--reset` reboots the board |
 
 ```bash
@@ -34,7 +34,7 @@ uv run python rover.py status
 uv run python rover.py wiggle               # wheels off the ground!
 uv run python camera.py <phone-ip>
 uv run python detect.py <phone-ip>          # vision only, no motors
-uv run python drive.py <phone-ip>           # Switch Pro: stick=drive, hold R=auto, A=STOP, X=record
+uv run python drive.py <phone-ip>           # Switch Pro: L+stick=drive, ZL+stick=boost, hold R=auto, A=STOP, X=record
 uv run python send.py '{"T":405}'           # Wi-Fi info over USB
 ```
 
@@ -51,14 +51,21 @@ lights run). Buttons are mapped by their **printed labels**:
 
 | Input | Action |
 | --- | --- |
-| Left stick | Manual drive (up/down throttle, left/right steer) — always overrides autonomous |
+| Hold **L** + left stick | Manual drive at `--max-speed` (default 0.2): up/down throttle, left/right steer |
+| Hold **ZL** + left stick | Manual drive at `--boost-speed` (default 0.4), e.g. to get over a threshold |
+| Left stick alone | Nothing. Let go of L/ZL to stop. Manual driving overrides autonomous |
 | Hold **R** | Autonomous: follow the detector. Release → stop (dead-man switch) |
 | **A** | Stop now and cancel autonomous |
 | **X** | Record frames to `data/raw/<session>/` (2 per second) |
 
-Letting go of the stick never reverses the rover: after driving one way, the opposite
-direction is ignored until the stick has rested at center for 0.25 s (the Switch Pro's
-stick rests past center for up to a second after release).
+Why the L/ZL enable: this controller's left stick doesn't always return to center. After
+release it has rested at about (+0.22, -0.30) for 30+ seconds, which read as "reverse".
+Requiring L or ZL means a stick resting off-center can't move the rover, and A's stop
+holds. The stick also has a round 0.5 deadzone: its resting points reached 0.41 from
+center (always back-right), and while L/ZL is held those would otherwise creep the rover
+backwards. Speed ramps up from zero at the deadzone edge, so you need to push past
+halfway before it moves. Recalibrating the stick on a Switch (System Settings →
+Controllers and Sensors) may help, and would allow a smaller deadzone.
 
 The panel under the video shows the mode and wheel speeds in large text, then the rover's
 status over Wi-Fi (polled about once a second): battery volts, pitch/roll from the

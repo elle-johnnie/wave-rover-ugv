@@ -7,7 +7,8 @@ The rover accepts commands as  GET http://<host>/js?json={...}
 
 Safety model:
   * Speeds are clamped to `max_speed` (default 0.25, gentle).
-  * A background thread re-sends the current command several times a second.
+  * A background thread sends each new command as soon as drive() changes it,
+    and otherwise re-sends the current one several times a second.
     That keeps the ESP32's Wi-Fi awake (cold requests can take ~1 s) and lets
     us enforce a dead-man timer: if drive() isn't called again within
     `deadman_s`, the rover is told to stop. A crashed or stalled control loop
@@ -102,6 +103,8 @@ class Rover:
         self._target = (0.0, 0.0)
         self._last_drive = 0.0
         self._stop_evt = threading.Event()
+        self._wake = threading.Event()  # set by drive() when the target changes: send now
+        self._sent = (0.0, 0.0)  # last target the keep-alive thread sent
         self._thread: threading.Thread | None = None
         self.consecutive_failures = 0
         self.last_latency_s: float | None = None
@@ -137,6 +140,9 @@ class Rover:
         with self._lock:
             self._target = (self._clamp(left), self._clamp(right))
             self._last_drive = time.monotonic()
+            changed = any(abs(a - b) > 0.005 for a, b in zip(self._target, self._sent))
+        if changed:
+            self._wake.set()  # don't wait for the next keep-alive tick
 
     def stop(self) -> None:
         with self._send_lock:  # nothing else can be mid-send once we zero the target
@@ -182,8 +188,10 @@ class Rover:
             return self._telemetry, time.monotonic() - self._telemetry_time
 
     def _loop(self) -> None:
+        """Send the target whenever it changes (woken by drive()), and at least every
+        `period` as a keep-alive. Status polls fill quiet moments, never delaying a change."""
         while not self._stop_evt.is_set():
-            t0 = time.monotonic()
+            self._wake.clear()
             # Read the target while holding the send lock, so a stop() can't slip in
             # between reading an old speed and sending it.
             with self._send_lock:
@@ -191,10 +199,12 @@ class Rover:
                     if time.monotonic() - self._last_drive > self.deadman_s:
                         self._target = (0.0, 0.0)
                     left, right = self._target
+                    self._sent = (left, right)
                 self._send_speeds(left, right)
-            if self.status_period_s and time.monotonic() - self._last_poll >= self.status_period_s:
+            if (self.status_period_s and not self._wake.is_set()
+                    and time.monotonic() - self._last_poll >= self.status_period_s):
                 self._poll_status()
-            self._stop_evt.wait(max(0.0, self.period - (time.monotonic() - t0)))
+            self._wake.wait(self.period)
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -207,6 +217,7 @@ class Rover:
 
     def close(self) -> None:
         self._stop_evt.set()
+        self._wake.set()
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None

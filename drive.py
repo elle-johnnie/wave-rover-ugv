@@ -1,7 +1,7 @@
 """Drive the rover: manual with a game controller, or autonomous from the detector.
 
     uv run python drive.py <phone-ip>
-    uv run python drive.py <phone-ip> --max-speed 0.2 --max-age 0.5
+    uv run python drive.py <phone-ip> --max-speed 0.2 --boost-speed 0.4 --max-age 0.5
 
 Controller -- Nintendo Switch Pro Controller (paired over Bluetooth in macOS settings).
 Buttons are mapped by their printed Nintendo labels:
@@ -10,11 +10,14 @@ Buttons are mapped by their printed Nintendo labels:
           Y            A  (STOP)
                  B
 
-    left stick   manual drive (up/down throttle, left/right steer)
+    hold L       enable manual drive with the left stick at --max-speed (default 0.2)
+    hold ZL      same, at --boost-speed (default 0.4) -- e.g. to get over a threshold
+                 Without L or ZL held the stick does nothing; let go of them to stop.
+    left stick   up/down throttle, left/right steer (only while L or ZL is held)
     hold R       AUTONOMOUS: follow the detector. Release -> stop (dead-man switch)
     A            stop now and cancel autonomous   (right face button)
     X            start/stop recording frames to data/raw/<session>/ (2 per second)  (top face button)
-    Touching the stick always overrides autonomous.
+    Driving with L/ZL + stick overrides autonomous.
 
     Other controllers work too, by label: on Xbox, A is the bottom button and X the
     left one; on PlayStation, A = Cross and X = Square. Check before relying on stop.
@@ -33,6 +36,7 @@ Safety, on top of rover.py's speed cap and 0.6 s dead-man stop:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -51,41 +55,18 @@ from camera import PhoneCamera, stream_url
 from detect import Decision, Detector, decide, draw
 from rover import DEFAULT_HOST, Rover, Status
 
-DEADZONE = 0.15
+# Round deadzone, sized for this Switch Pro's left stick: after release it can rest anywhere
+# up to about 0.41 from center, toward back-right (e.g. (+0.26, -0.31) for 2.5 s). Outside it, speed ramps
+# up from zero, so there's no jump at the edge.
+DEADZONE = 0.5
 TURN_GAIN = 0.6  # how much steering adds/subtracts relative to max speed
-SETTLE_S = 0.25  # stick must rest in the deadzone this long before the opposite direction counts
-
-
-class ReversalGuard:
-    """Ignore stick snap-back. Some sticks (seen on a Switch Pro) rest around -0.35 for up to a
-    second after you let go of forward, which read as 'reverse'. After moving one way, the
-    opposite direction is ignored until the stick has sat in the deadzone for SETTLE_S."""
-
-    def __init__(self, settle_s: float = SETTLE_S) -> None:
-        self.settle_s = settle_s
-        self.last_sign = 0  # direction we last drove: -1, 0 (free), +1
-        self.neutral_since: float | None = None
-
-    def __call__(self, v: float, now: float) -> float:
-        if v == 0.0:  # in the deadzone
-            if self.neutral_since is None:
-                self.neutral_since = now
-            if now - self.neutral_since >= self.settle_s:
-                self.last_sign = 0
-            return 0.0
-        self.neutral_since = None
-        sign = 1 if v > 0 else -1
-        if self.last_sign and sign != self.last_sign:
-            return 0.0  # opposite of what we just did and never settled: treat as snap-back
-        self.last_sign = sign
-        return v
-
-
 @dataclass
 class Inputs:
     throttle: float = 0.0  # -1..1, forward positive
     steer: float = 0.0  # -1..1, right positive
     auto_held: bool = False
+    drive_held: bool = False  # L: stick drives at --max-speed
+    boost_held: bool = False  # ZL: stick drives at --boost-speed
     stop_pressed: bool = False
     record_pressed: bool = False
     connected: bool = False
@@ -96,7 +77,7 @@ class Inputs:
 
 class Gamepad:
     """Controller input via SDL's GameController API, set up for the Switch Pro Controller:
-    left stick drives, R (right shoulder) holds autonomous, A stops, X records."""
+    hold L (or ZL for boost) + left stick drives, hold R for autonomous, A stops, X records."""
 
     def __init__(self) -> None:
         import pygame
@@ -109,7 +90,6 @@ class Gamepad:
         self.name = "no controller"
         self._prev = {"stop": False, "record": False}
         self._last_scan = 0.0
-        self._guard_y, self._guard_x = ReversalGuard(), ReversalGuard()
         self._scan()
 
     def _scan(self) -> None:
@@ -118,12 +98,14 @@ class Gamepad:
             if self.ctl.is_controller(i):
                 self.pad = self.ctl.Controller(i)
                 self.name = self.pad.name
-                print(f"[pad] using {self.name}: stick=drive, hold R=autonomous, A=STOP, X=record")
+                print(f"[pad] using {self.name}: hold L+stick=drive, ZL+stick=boost, hold R=autonomous, A=STOP, X=record")
                 return
 
-    def _axis(self, a: int) -> float:
-        v = self.pad.get_axis(a) / 32767.0
-        return 0.0 if abs(v) < DEADZONE else max(-1.0, min(1.0, v))
+    def _stick(self) -> tuple[float, float]:
+        """(throttle, steer) after the round deadzone; forward and right are positive."""
+        pg = self.pg
+        return apply_deadzone(self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTX) / 32767.0,
+                              -self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTY) / 32767.0)
 
     def _edge(self, key: str, now_down: bool) -> bool:
         pressed = now_down and not self._prev[key]
@@ -142,11 +124,13 @@ class Gamepad:
                 self._scan()
             return Inputs()
         b = self.pad.get_button
-        now = time.monotonic()
+        throttle, steer = self._stick()
         return Inputs(
-            throttle=self._guard_y(-self._axis(pg.CONTROLLER_AXIS_LEFTY), now),
-            steer=self._guard_x(self._axis(pg.CONTROLLER_AXIS_LEFTX), now),
+            throttle=throttle,
+            steer=steer,
             auto_held=bool(b(pg.CONTROLLER_BUTTON_RIGHTSHOULDER)),  # Switch: R
+            drive_held=bool(b(pg.CONTROLLER_BUTTON_LEFTSHOULDER)),  # Switch: L
+            boost_held=self.pad.get_axis(pg.CONTROLLER_AXIS_TRIGGERLEFT) > 16000,  # Switch: ZL (digital)
             stop_pressed=self._edge("stop", bool(b(pg.CONTROLLER_BUTTON_A))),  # Switch: A (right)
             record_pressed=self._edge("record", bool(b(pg.CONTROLLER_BUTTON_X))),  # Switch: X (top)
             connected=True,
@@ -154,6 +138,16 @@ class Gamepad:
             raw_x=self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTX) / 32767.0,
             raw_y=-self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTY) / 32767.0,
         )
+
+
+def apply_deadzone(x: float, y: float, dz: float = DEADZONE) -> tuple[float, float]:
+    """Round deadzone on stick (x right, y forward) -> (throttle, steer), rescaled so the
+    output starts at 0 at the deadzone edge and reaches 1 at full deflection."""
+    m = math.hypot(x, y)
+    if m < dz:
+        return 0.0, 0.0
+    k = min(1.0, (m - dz) / (1.0 - dz)) / m
+    return y * k, x * k
 
 
 def mix(throttle: float, steer: float, max_speed: float) -> tuple[float, float]:
@@ -165,9 +159,14 @@ def mix(throttle: float, steer: float, max_speed: float) -> tuple[float, float]:
 
 
 def choose(inp: Inputs, auto_latched: bool, decision: Decision | None, frame_age: float,
-           max_age: float, max_speed: float) -> tuple[str, tuple[float, float]]:
-    """Return (mode label, wheel speeds). Pure, so the safety rules are testable."""
-    if inp.throttle or inp.steer:
+           max_age: float, max_speed: float, boost_speed: float | None = None) -> tuple[str, tuple[float, float]]:
+    """Return (mode label, wheel speeds). Pure, so the safety rules are testable.
+
+    The stick only drives while L (normal) or ZL (boost) is held, so a stick that rests
+    off-center can't move the rover, and letting go of L/ZL always stops manual driving."""
+    if (inp.drive_held or inp.boost_held) and (inp.throttle or inp.steer):
+        if inp.boost_held:
+            return "MANUAL BOOST", mix(inp.throttle, inp.steer, boost_speed or max_speed)
         return "MANUAL", mix(inp.throttle, inp.steer, max_speed)
     if inp.auto_held or auto_latched:
         if decision is None or frame_age > max_age:
@@ -235,7 +234,9 @@ def main() -> None:
     p.add_argument("--model", default="yolov8n-640")
     p.add_argument("--confidence", type=float, default=0.4)
     p.add_argument("--near", type=float, default=0.55)
-    p.add_argument("--max-speed", type=float, default=0.2, help="cap for manual driving (and rover clamp)")
+    p.add_argument("--max-speed", type=float, default=0.2, help="manual driving speed while holding L")
+    p.add_argument("--boost-speed", type=float, default=0.4,
+                   help="manual driving speed while holding ZL (rover range is about 0.5)")
     p.add_argument("--max-age", type=float, default=0.5, help="autonomous stops if frames are older than this (s)")
     p.add_argument("--no-pad", action="store_true", help="don't look for a game controller")
     p.add_argument("--log", action="store_true",
@@ -265,7 +266,7 @@ def main() -> None:
                       f"{'ok' if ok else 'FAILED'} ({thread})\n")
 
     print(f"opening {stream_url(args.source)}; rover at {args.host}. Rover starts STOPPED.")
-    with Rover(args.host, max_speed=args.max_speed, on_send=log_send) as rover, PhoneCamera(stream_url(args.source)) as cam:
+    with Rover(args.host, max_speed=max(args.max_speed, args.boost_speed), on_send=log_send) as rover, PhoneCamera(stream_url(args.source)) as cam:
         try:
             while True:
                 inp = pad.poll() if pad else Inputs()
@@ -292,13 +293,15 @@ def main() -> None:
                     recording = not recording
                     print(f"recording -> {rec_dir}" if recording else "recording stopped")
 
-                mode, (left, right) = choose(inp, auto_latched, decision, age, args.max_age, args.max_speed)
+                mode, (left, right) = choose(inp, auto_latched, decision, age, args.max_age,
+                                       args.max_speed, args.boost_speed)
                 if inp.stop_pressed or key == ord("x"):
                     mode, left, right = "STOP", 0.0, 0.0
                 rover.drive(left, right)
                 if log and (mode != last_mode or left or right or inp.raw_x or inp.raw_y):
                     log.write(f"{time.monotonic() - t_start:9.3f} LOOP  {mode:28s} stick x={inp.raw_x:+.3f} "
-                              f"y={inp.raw_y:+.3f} -> L={left:+.3f} R={right:+.3f}\n")
+                              f"y={inp.raw_y:+.3f} {'L' if inp.drive_held else '-'}{'ZL' if inp.boost_held else '--'} "
+                              f"-> L={left:+.3f} R={right:+.3f}\n")
                 if mode != last_mode:
                     print(f"{datetime.now():%H:%M:%S}  {mode}")
                     last_mode = mode

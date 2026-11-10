@@ -49,7 +49,7 @@ import numpy as np
 
 from camera import PhoneCamera, stream_url
 from detect import Decision, Detector, decide, draw
-from rover import DEFAULT_HOST, Rover
+from rover import DEFAULT_HOST, Rover, Status
 
 DEADZONE = 0.15
 TURN_GAIN = 0.6  # how much steering adds/subtracts relative to max speed
@@ -176,6 +176,58 @@ def choose(inp: Inputs, auto_latched: bool, decision: Decision | None, frame_age
     return "IDLE", (0.0, 0.0)
 
 
+BATT_LOW_V, BATT_CRIT_V = 10.8, 10.2  # 3S pack: ~12.6 V full
+MAIN_POWER_OFF_V = 5.0  # below this the board is on USB power only; motors are dead
+TILT_WARN_DEG = 25.0  # firmware cuts the motors at ~34 deg pitch
+STALE_S = 1.5
+WHITE, AMBER, RED, GREY = (255, 255, 255), (0, 200, 255), (60, 60, 255), (170, 170, 170)
+
+
+def rover_lines(st: Status | None, age: float, latency_s: float | None) -> list[tuple[str, tuple]]:
+    """Telemetry line plus any warnings, as (text, BGR color). Pure, so it's testable."""
+    if st is None or age > STALE_S:
+        return [("NO ROVER STATUS - off, or Wi-Fi link lost" if st is None
+                 else f"NO ROVER STATUS for {age:.1f}s - Wi-Fi link lost?", RED)]
+    pitch, roll = (round(a) + 0 for a in st.tilt_deg)  # +0 turns -0 into 0
+    link = f"{latency_s * 1000:.0f}ms" if latency_s else "?"
+    lines = [(f"battery {st.volts:.1f}V   pitch {pitch:+d}  roll {roll:+d} deg   link {link}", WHITE)]
+    if st.volts < MAIN_POWER_OFF_V:
+        lines.append(("MAIN POWER OFF - USB only, motors won't run", RED))
+    elif st.volts < BATT_CRIT_V:
+        lines.append((f"BATTERY CRITICAL {st.volts:.1f} V - stop and charge", RED))
+    elif st.volts < BATT_LOW_V:
+        lines.append((f"battery low {st.volts:.1f} V", AMBER))
+    if st.upside_down:
+        lines.append(("UPSIDE DOWN", RED))
+    elif abs(pitch) >= TILT_WARN_DEG or abs(roll) >= TILT_WARN_DEG:
+        lines.append((f"TILTING pitch {pitch:+.0f} roll {roll:+.0f} deg (motor cutoff ~34)", RED))
+    return lines
+
+
+def status_panel(width: int, mode: str, left: float, right: float, recording: bool,
+                 rover: list[tuple[str, tuple]]) -> np.ndarray:
+    """Dark panel shown under the video: big mode line, then rover status and warnings."""
+    k = max(0.8, width / 640)  # scale text with the video width
+    big, small = 1.1 * k, 0.7 * k
+    row_big, row_small = int(44 * k), int(30 * k)
+    panel = np.full((int(14 * k) + row_big + row_small * len(rover), width, 3), 30, np.uint8)
+    color = RED if mode.startswith(("STOP", "AUTO: camera")) else AMBER if mode.startswith("AUTO") else WHITE
+    margin = int(12 * k)
+
+    def put(text: str, y: int, scale: float, c: tuple, thick: int) -> None:
+        w = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thick)[0][0]
+        scale *= min(1.0, (width - 2 * margin) / w)  # shrink long lines to fit
+        cv2.putText(panel, text, (margin, y), cv2.FONT_HERSHEY_SIMPLEX, scale, c, thick, cv2.LINE_AA)
+
+    y = row_big
+    put(f"{mode}   L={left:+.2f} R={right:+.2f}" + ("   [REC]" if recording else ""),
+        y, big, color, max(2, int(2.5 * k)))
+    for text, c in rover:
+        y += row_small
+        put(text, y, small, c, max(1, int(1.6 * k)))
+    return panel
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", help="phone IP (IP Webcam) or stream URL")
@@ -198,6 +250,7 @@ def main() -> None:
     auto_latched = False
     last_count, decision, overlay_src = -1, None, None
     last_mode = ""
+    last_warnings: list[str] = []
     log = None
     if args.log:
         log_path = Path("data/logs") / f"{datetime.now():%Y%m%d-%H%M%S}.log"
@@ -261,12 +314,15 @@ def main() -> None:
                     out = draw(f, det, labels, decision, args.near, lanes, info)
                 else:
                     out = np.zeros((480, 640, 3), np.uint8)
-                hud = f"{mode}  L={left:+.2f} R={right:+.2f}" + ("  [REC]" if recording else "")
-                color = (60, 60, 255) if mode.startswith(("STOP", "AUTO: camera")) else \
-                        (0, 200, 255) if mode.startswith("AUTO") else (255, 255, 255)
-                cv2.putText(out, hud, (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(out, hud, (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-                cv2.imshow("rover drive", out)
+                st, st_age = rover.telemetry()
+                rlines = rover_lines(st, st_age, rover.last_latency_s)
+                warnings = [t for t, c in rlines if c != WHITE]
+                for w in warnings:
+                    if w not in last_warnings and not w.startswith("NO ROVER STATUS for"):
+                        print(f"{datetime.now():%H:%M:%S}  WARNING: {w}")
+                last_warnings = warnings
+                panel = status_panel(out.shape[1], mode, left, right, recording, rlines)
+                cv2.imshow("rover drive", np.vstack([out, panel]))
         except KeyboardInterrupt:
             pass
         finally:

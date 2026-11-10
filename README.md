@@ -60,6 +60,12 @@ Letting go of the stick never reverses the rover: after driving one way, the opp
 direction is ignored until the stick has rested at center for 0.25 s (the Switch Pro's
 stick rests past center for up to a second after release).
 
+The panel under the video shows the mode and wheel speeds in large text, then the rover's
+status over Wi-Fi (polled about once a second): battery volts, pitch/roll from the
+accelerometer, and link latency. Warnings appear there in amber/red and print in the
+terminal: main power off (USB only), battery low (< 10.8 V) or critical (< 10.2 V),
+tilting past 25°, upside down, and no status from the rover.
+
 Keyboard fallback in the preview window: `space` arm/disarm autonomous (latched — no
 dead-man), `x` stop, `r` record, `q` quit. Add `--log` to record every stick reading and
 rover command to `data/logs/`.

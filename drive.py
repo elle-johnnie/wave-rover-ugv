@@ -41,6 +41,32 @@ from rover import DEFAULT_HOST, Rover
 
 DEADZONE = 0.15
 TURN_GAIN = 0.6  # how much steering adds/subtracts relative to max speed
+SETTLE_S = 0.25  # stick must rest in the deadzone this long before the opposite direction counts
+
+
+class ReversalGuard:
+    """Ignore stick snap-back. Some sticks (seen on a Switch Pro) rest around -0.35 for up to a
+    second after you let go of forward, which read as 'reverse'. After moving one way, the
+    opposite direction is ignored until the stick has sat in the deadzone for SETTLE_S."""
+
+    def __init__(self, settle_s: float = SETTLE_S) -> None:
+        self.settle_s = settle_s
+        self.last_sign = 0  # direction we last drove: -1, 0 (free), +1
+        self.neutral_since: float | None = None
+
+    def __call__(self, v: float, now: float) -> float:
+        if v == 0.0:  # in the deadzone
+            if self.neutral_since is None:
+                self.neutral_since = now
+            if now - self.neutral_since >= self.settle_s:
+                self.last_sign = 0
+            return 0.0
+        self.neutral_since = None
+        sign = 1 if v > 0 else -1
+        if self.last_sign and sign != self.last_sign:
+            return 0.0  # opposite of what we just did and never settled: treat as snap-back
+        self.last_sign = sign
+        return v
 
 
 @dataclass
@@ -52,6 +78,8 @@ class Inputs:
     record_pressed: bool = False
     connected: bool = False
     name: str = "no controller"
+    raw_x: float = 0.0  # stick before deadzone, for the --log diagnostics
+    raw_y: float = 0.0
 
 
 class Gamepad:
@@ -68,6 +96,7 @@ class Gamepad:
         self.name = "no controller"
         self._prev = {"stop": False, "record": False}
         self._last_scan = 0.0
+        self._guard_y, self._guard_x = ReversalGuard(), ReversalGuard()
         self._scan()
 
     def _scan(self) -> None:
@@ -100,14 +129,17 @@ class Gamepad:
                 self._scan()
             return Inputs()
         b = self.pad.get_button
+        now = time.monotonic()
         return Inputs(
-            throttle=-self._axis(pg.CONTROLLER_AXIS_LEFTY),
-            steer=self._axis(pg.CONTROLLER_AXIS_LEFTX),
+            throttle=self._guard_y(-self._axis(pg.CONTROLLER_AXIS_LEFTY), now),
+            steer=self._guard_x(self._axis(pg.CONTROLLER_AXIS_LEFTX), now),
             auto_held=bool(b(pg.CONTROLLER_BUTTON_RIGHTSHOULDER)),
             stop_pressed=self._edge("stop", bool(b(pg.CONTROLLER_BUTTON_B))),
             record_pressed=self._edge("record", bool(b(pg.CONTROLLER_BUTTON_Y))),
             connected=True,
             name=self.name,
+            raw_x=self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTX) / 32767.0,
+            raw_y=-self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTY) / 32767.0,
         )
 
 
@@ -141,6 +173,8 @@ def main() -> None:
     p.add_argument("--max-speed", type=float, default=0.2, help="cap for manual driving (and rover clamp)")
     p.add_argument("--max-age", type=float, default=0.5, help="autonomous stops if frames are older than this (s)")
     p.add_argument("--no-pad", action="store_true", help="don't look for a game controller")
+    p.add_argument("--log", action="store_true",
+                   help="write every loop and every command sent to data/logs/<time>.log (diagnostics)")
     args = p.parse_args()
 
     lanes = (0.3, 0.7)
@@ -151,9 +185,21 @@ def main() -> None:
     auto_latched = False
     last_count, decision, overlay_src = -1, None, None
     last_mode = ""
+    log = None
+    if args.log:
+        log_path = Path("data/logs") / f"{datetime.now():%Y%m%d-%H%M%S}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = open(log_path, "w", buffering=1)
+        print(f"logging to {log_path}")
+    t_start = time.monotonic()
+
+    def log_send(left: float, right: float, ok: bool, thread: str) -> None:
+        if log:
+            log.write(f"{time.monotonic() - t_start:9.3f} SENT  L={left:+.3f} R={right:+.3f} "
+                      f"{'ok' if ok else 'FAILED'} ({thread})\n")
 
     print(f"opening {stream_url(args.source)}; rover at {args.host}. Rover starts STOPPED.")
-    with Rover(args.host, max_speed=args.max_speed) as rover, PhoneCamera(stream_url(args.source)) as cam:
+    with Rover(args.host, max_speed=args.max_speed, on_send=log_send) as rover, PhoneCamera(stream_url(args.source)) as cam:
         try:
             while True:
                 inp = pad.poll() if pad else Inputs()
@@ -184,6 +230,9 @@ def main() -> None:
                 if inp.stop_pressed or key == ord("x"):
                     mode, left, right = "STOP", 0.0, 0.0
                 rover.drive(left, right)
+                if log and (mode != last_mode or left or right or inp.raw_x or inp.raw_y):
+                    log.write(f"{time.monotonic() - t_start:9.3f} LOOP  {mode:28s} stick x={inp.raw_x:+.3f} "
+                              f"y={inp.raw_y:+.3f} -> L={left:+.3f} R={right:+.3f}\n")
                 if mode != last_mode:
                     print(f"{datetime.now():%H:%M:%S}  {mode}")
                     last_mode = mode
@@ -209,6 +258,8 @@ def main() -> None:
             pass
         finally:
             rover.stop()
+    if log:
+        log.close()
     cv2.destroyAllWindows()
     print("rover stopped")
 

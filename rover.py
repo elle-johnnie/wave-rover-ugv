@@ -61,6 +61,7 @@ class Rover:
         deadman_s: float = 0.6,
         timeout_s: float = 0.8,
         verbose: bool = False,
+        on_send=None,
     ):
         self.base = f"http://{host}/js"
         self.max_speed = max_speed
@@ -68,6 +69,7 @@ class Rover:
         self.deadman_s = deadman_s
         self.timeout_s = timeout_s
         self.verbose = verbose
+        self.on_send = on_send  # optional callback(left, right, ok, thread_name) for diagnostics
 
         self._lock = threading.Lock()
         self._target = (0.0, 0.0)
@@ -120,13 +122,18 @@ class Rover:
         self.send({"T": 999})
 
     def _send_speeds(self, left: float, right: float) -> None:
+        ok = False
         try:
             self.send({"T": 1, "L": round(left, 3), "R": round(right, 3)})
             self.consecutive_failures = 0
+            ok = True
         except requests.RequestException as e:
             self.consecutive_failures += 1
             if self.verbose or self.consecutive_failures in (1, 5, 20):
                 print(f"[rover] send failed ({self.consecutive_failures}x): {e.__class__.__name__}")
+        finally:
+            if self.on_send:
+                self.on_send(left, right, ok, threading.current_thread().name)
 
     def _loop(self) -> None:
         while not self._stop_evt.is_set():

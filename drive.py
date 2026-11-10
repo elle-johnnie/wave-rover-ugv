@@ -3,12 +3,21 @@
     uv run python drive.py <phone-ip>
     uv run python drive.py <phone-ip> --max-speed 0.2 --max-age 0.5
 
-Controller (Xbox / PlayStation / Switch Pro, paired over Bluetooth in macOS settings):
-    left stick        manual drive (up/down throttle, left/right steer)
-    hold RB / R1      AUTONOMOUS: follow the detector. Release -> stop (dead-man switch)
-    B / Circle        stop now and cancel autonomous
-    Y / Triangle      start/stop recording frames to data/raw/<session>/ (2 per second)
+Controller -- Nintendo Switch Pro Controller (paired over Bluetooth in macOS settings).
+Buttons are mapped by their printed Nintendo labels:
+
+                 X  (record)
+          Y            A  (STOP)
+                 B
+
+    left stick   manual drive (up/down throttle, left/right steer)
+    hold R       AUTONOMOUS: follow the detector. Release -> stop (dead-man switch)
+    A            stop now and cancel autonomous   (right face button)
+    X            start/stop recording frames to data/raw/<session>/ (2 per second)  (top face button)
     Touching the stick always overrides autonomous.
+
+    Other controllers work too, by label: on Xbox, A is the bottom button and X the
+    left one; on PlayStation, A = Cross and X = Square. Check before relying on stop.
 
 Keyboard (preview window focused; works with or without a controller):
     space  arm/disarm autonomous (latched -- no dead-man, so stay near x!)
@@ -31,6 +40,9 @@ from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+# Map Nintendo controllers by printed label (A means the button marked "A"), not by
+# Xbox position. Must be set before SDL starts, i.e. before pygame is imported.
+os.environ["SDL_GAMECONTROLLER_USE_BUTTON_LABELS"] = "1"
 
 import cv2
 import numpy as np
@@ -83,7 +95,8 @@ class Inputs:
 
 
 class Gamepad:
-    """Standardized controller input via SDL's GameController mapping (same layout for Xbox/PS/Switch)."""
+    """Controller input via SDL's GameController API, set up for the Switch Pro Controller:
+    left stick drives, R (right shoulder) holds autonomous, A stops, X records."""
 
     def __init__(self) -> None:
         import pygame
@@ -105,7 +118,7 @@ class Gamepad:
             if self.ctl.is_controller(i):
                 self.pad = self.ctl.Controller(i)
                 self.name = self.pad.name
-                print(f"[pad] using {self.name}")
+                print(f"[pad] using {self.name}: stick=drive, hold R=autonomous, A=STOP, X=record")
                 return
 
     def _axis(self, a: int) -> float:
@@ -133,9 +146,9 @@ class Gamepad:
         return Inputs(
             throttle=self._guard_y(-self._axis(pg.CONTROLLER_AXIS_LEFTY), now),
             steer=self._guard_x(self._axis(pg.CONTROLLER_AXIS_LEFTX), now),
-            auto_held=bool(b(pg.CONTROLLER_BUTTON_RIGHTSHOULDER)),
-            stop_pressed=self._edge("stop", bool(b(pg.CONTROLLER_BUTTON_B))),
-            record_pressed=self._edge("record", bool(b(pg.CONTROLLER_BUTTON_Y))),
+            auto_held=bool(b(pg.CONTROLLER_BUTTON_RIGHTSHOULDER)),  # Switch: R
+            stop_pressed=self._edge("stop", bool(b(pg.CONTROLLER_BUTTON_A))),  # Switch: A (right)
+            record_pressed=self._edge("record", bool(b(pg.CONTROLLER_BUTTON_X))),  # Switch: X (top)
             connected=True,
             name=self.name,
             raw_x=self.pad.get_axis(pg.CONTROLLER_AXIS_LEFTX) / 32767.0,

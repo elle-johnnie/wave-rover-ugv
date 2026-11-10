@@ -15,6 +15,13 @@ Safety model:
   * Leaving a `with Rover(...)` block (including via an exception or Ctrl-C)
     always sends stop.
 
+Status polling over Wi-Fi (no USB needed):
+  The same keep-alive thread asks for {"T":130} about once a second, taking turns
+  with the drive commands. All requests go out one at a time (a send lock), because
+  the ESP32's web server is single-threaded: parallel requests can be applied late
+  and out of order, so an old "drive" could land after a "stop".
+  `rover.telemetry()` returns the latest Status and its age in seconds.
+
 CLI (wheels off the ground for anything that moves!):
     uv run python rover.py status
     uv run python rover.py stop
@@ -26,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import threading
 import time
@@ -38,13 +46,26 @@ DEFAULT_HOST = os.environ.get("ROVER_HOST", "192.168.68.88")
 
 @dataclass
 class Status:
-    left: float
+    left: float  # wheel speeds the rover reports it is applying
     right: float
-    roll: float
+    roll: float  # firmware's fused angles, radians (seen frozen at r=3.05/p=0 on this rover)
     pitch: float
     accel_z: float
-    voltage_raw: float
+    voltage_raw: float  # volts * 100
     raw: dict
+
+    @property
+    def volts(self) -> float:
+        return self.voltage_raw / 100.0
+
+    @property
+    def tilt_deg(self) -> tuple[float, float]:
+        """(pitch, roll) in degrees from the raw accelerometer, which stays live even when
+        the firmware's fused r/p values are stuck. Only meaningful when not accelerating hard."""
+        ax, ay, az = (float(self.raw.get(k, 0.0)) for k in ("ax", "ay", "az"))
+        pitch = math.degrees(math.atan2(-ax, math.hypot(ay, az)))
+        roll = math.degrees(math.atan2(ay, az))
+        return pitch, roll
 
     @property
     def upside_down(self) -> bool:
@@ -62,6 +83,7 @@ class Rover:
         timeout_s: float = 0.8,
         verbose: bool = False,
         on_send=None,
+        status_period_s: float = 1.0,
     ):
         self.base = f"http://{host}/js"
         self.max_speed = max_speed
@@ -71,7 +93,12 @@ class Rover:
         self.verbose = verbose
         self.on_send = on_send  # optional callback(left, right, ok, thread_name) for diagnostics
 
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards target/telemetry (held briefly, never during I/O)
+        self._send_lock = threading.RLock()  # only one request in flight to the rover at a time
+        self.status_period_s = status_period_s
+        self._last_poll = 0.0
+        self._telemetry: Status | None = None
+        self._telemetry_time = 0.0
         self._target = (0.0, 0.0)
         self._last_drive = 0.0
         self._stop_evt = threading.Event()
@@ -82,12 +109,14 @@ class Rover:
     # ---- low level -------------------------------------------------------
 
     def send(self, cmd: dict) -> str:
-        """Send one JSON command and return the raw reply text."""
-        t0 = time.monotonic()
-        r = requests.get(self.base, params={"json": json.dumps(cmd, separators=(",", ":"))}, timeout=self.timeout_s)
-        r.raise_for_status()
-        self.last_latency_s = time.monotonic() - t0
-        return r.text
+        """Send one JSON command and return the raw reply text (one request at a time)."""
+        with self._send_lock:
+            t0 = time.monotonic()
+            r = requests.get(self.base, params={"json": json.dumps(cmd, separators=(",", ":"))},
+                             timeout=self.timeout_s)
+            r.raise_for_status()
+            self.last_latency_s = time.monotonic() - t0
+            return r.text
 
     def status(self) -> Status:
         text = self.send({"T": 130})
@@ -110,9 +139,10 @@ class Rover:
             self._last_drive = time.monotonic()
 
     def stop(self) -> None:
-        with self._lock:
-            self._target = (0.0, 0.0)
-        self._send_speeds(0.0, 0.0)
+        with self._send_lock:  # nothing else can be mid-send once we zero the target
+            with self._lock:
+                self._target = (0.0, 0.0)
+            self._send_speeds(0.0, 0.0)
 
     def emergency_stop(self) -> None:
         self.stop()
@@ -135,14 +165,35 @@ class Rover:
             if self.on_send:
                 self.on_send(left, right, ok, threading.current_thread().name)
 
+    def _poll_status(self) -> None:
+        self._last_poll = time.monotonic()
+        try:
+            st = self.status()
+        except (requests.RequestException, ValueError):
+            return  # telemetry age keeps growing, which shows the link is down
+        with self._lock:
+            self._telemetry, self._telemetry_time = st, time.monotonic()
+
+    def telemetry(self) -> tuple[Status | None, float]:
+        """(latest Status or None, its age in seconds; inf if none yet)."""
+        with self._lock:
+            if self._telemetry is None:
+                return None, float("inf")
+            return self._telemetry, time.monotonic() - self._telemetry_time
+
     def _loop(self) -> None:
         while not self._stop_evt.is_set():
             t0 = time.monotonic()
-            with self._lock:
-                if t0 - self._last_drive > self.deadman_s:
-                    self._target = (0.0, 0.0)
-                left, right = self._target
-            self._send_speeds(left, right)
+            # Read the target while holding the send lock, so a stop() can't slip in
+            # between reading an old speed and sending it.
+            with self._send_lock:
+                with self._lock:
+                    if time.monotonic() - self._last_drive > self.deadman_s:
+                        self._target = (0.0, 0.0)
+                    left, right = self._target
+                self._send_speeds(left, right)
+            if self.status_period_s and time.monotonic() - self._last_poll >= self.status_period_s:
+                self._poll_status()
             self._stop_evt.wait(max(0.0, self.period - (time.monotonic() - t0)))
 
     # ---- lifecycle -------------------------------------------------------
@@ -198,8 +249,9 @@ def main() -> None:
         for _ in range(3):
             s = rover.status()
             lat.append(rover.last_latency_s * 1000)
-        print(f"wheels L={s.left} R={s.right}  roll={s.roll:.2f} pitch={s.pitch:.2f}  v={s.voltage_raw}"
-              f"  upside_down={s.upside_down}")
+        pitch, roll = s.tilt_deg
+        print(f"battery {s.volts:.2f} V  pitch {pitch:+.1f} deg  roll {roll:+.1f} deg  "
+              f"wheels L={s.left} R={s.right}  upside_down={s.upside_down}")
         print("latency ms: " + ", ".join(f"{x:.0f}" for x in lat))
         return
 
